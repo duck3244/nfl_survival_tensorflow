@@ -284,16 +284,12 @@ nfl-survival-tensorflow/
 │   ├── prediction_utils.py         # 예측 유틸리티
 │   └── main.py                     # 통합 파이프라인
 │
-├── 🌐 웹 (Web Interface)
-│   └── interactive_dashboard.html  # 웹 대시보드
 │
 ├── 📚 문서 (Documentation)
-│   ├── README.md                   # 이 파일
+│   └── README.md                   # 이 파일
 │
 ├── ⚙️ 설정 (Configuration)
-│   ├── requirements.txt            # 패키지 목록
-│   ├── .gitignore                 # Git 제외
-│   └── setup.py                   # 설치 스크립트
+│   └── requirements.txt            # 패키지 목록
 │
 ├── 📊 데이터 (Data)
 │   └── nfl.csv                    # NFL 데이터셋
@@ -406,15 +402,5 @@ L(θ) = -∑ᵢ δᵢ[ηᵢ - log(∑ⱼ∈Rᵢ exp(ηⱼ))]
 1. **YPC가 가장 중요**: 선수의 경기력이 커리어 길이에 결정적
 2. **BMI는 생존력과 관련**: 단단한 체격이 부상 예방에 도움
 3. **Draft Age는 상대적으로 영향 적음**: 재능이 나이보다 중요
-
----
-
-## 📖 문서
-
-### 참고 문서
-
-- **[API_REFERENCE.md](API_REFERENCE.md)**: API 문서
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: 기여 가이드
-- **[CHANGELOG.md](CHANGELOG.md)**: 변경 이력
 
 ---
