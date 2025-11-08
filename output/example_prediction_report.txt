@@ -1,0 +1,29 @@
+======================================================================
+NFL RUNNING BACK CAREER PREDICTION REPORT
+======================================================================
+
+Player: Example Player
+----------------------------------------------------------------------
+  BMI (Body Mass Index):    29.0
+  YPC (Yards Per Carry):    4.5
+  Draft Age:                21
+
+PREDICTION RESULTS
+----------------------------------------------------------------------
+  Risk Score:               -0.1401
+  Risk Level:               Moderate
+  Expected Career:          58 games
+  Grade:                    📊 Average
+
+SURVIVAL PROBABILITIES
+----------------------------------------------------------------------
+  At  50 games:            54.6%
+  At 100 games:            25.3%
+  At 150 games:            7.3%
+
+INTERPRETATION
+----------------------------------------------------------------------
+  Average career length expected. Performance and injury prevention will be key factors.
+  Expected to play approximately 58 games
+
+======================================================================

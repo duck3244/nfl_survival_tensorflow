@@ -1,0 +1,11 @@
+Player,BMI,YPC,Draft_Age,Risk_Score,Predicted_Career,Actual_Career,Survival_100,Grade,Prediction_Error
+Emmitt Smith,31.0,4.2,21,-0.14324225,58,226.0,25.399385779541316,📊 Average,168.0
+Barry Sanders,29.2,5.0,21,-0.1372804,58,153.0,25.19209464809177,📊 Average,95.0
+Walter Payton,30.0,4.4,21,-0.13843252,58,190.0,25.232116963467714,📊 Average,132.0
+Ezekiel Elliott,29.0,4.5,21,-0.14012158,58,,25.29082491464131,📊 Average,
+Saquon Barkley,30.2,4.6,21,-0.1403295,58,,25.298051981434988,📊 Average,
+LaDainian Tomlinson,30.5,4.4,22,-0.11952235,57,170.0,24.577457592446343,📊 Average,113.0
+Adrian Peterson,31.8,4.8,22,-0.11280654,57,165.0,24.346141171794915,📊 Average,108.0
+Eric Dickerson,31.5,4.6,22,-0.118740216,57,146.0,24.550484032552458,📊 Average,89.0
+Derrick Henry,32.0,5.0,22,-0.10582511,57,,24.106353347081477,📊 Average,
+Bo Jackson,32.5,5.4,23,0.11519405,45,38.0,16.95521861588632,⚠️ Below Average,7.0
