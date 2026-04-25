@@ -10,93 +10,81 @@ from typing import Dict, Tuple, Optional, List
 
 
 class PlayerPredictor:
-    """선수 커리어 예측 클래스"""
-    
-    def __init__(self, model, kmf: Optional[KaplanMeierFitter] = None):
+    """선수 커리어 예측 클래스 (feature-name 기반, 일반화 버전)"""
+
+    def __init__(self, model, kmf: Optional[KaplanMeierFitter] = None,
+                 feature_names: Optional[List[str]] = None):
         """
-        Parameters:
-        -----------
-        model : DeepSurv
-            학습된 모델
-        kmf : KaplanMeierFitter
-            기준 Kaplan-Meier 추정기
+        feature_names가 명시되지 않으면 model.feature_names를 사용한다.
+        kmf가 주어지면 baseline survival 출처로 우선 사용한다 (학습 직후 시나리오).
+        그 외에는 model에 저장된 baseline_survival을 사용한다.
         """
         self.model = model
         self.kmf = kmf
-    
-    def predict_player(self,
-                      bmi: float,
-                      ypc: float,
-                      draft_age: int,
-                      max_games: int = 200) -> Dict:
-        """
-        개별 선수 예측
-        
-        Parameters:
-        -----------
-        bmi : float
-            Body Mass Index
-        ypc : float
-            Yards Per Carry
-        draft_age : int
-            드래프트 나이
-        max_games : int
-            최대 경기 수
-        
-        Returns:
-        --------
-        prediction : dict
-            예측 결과 딕셔너리
-        """
-        # 특징 벡터 생성
-        features = np.array([[bmi, ypc, draft_age]])
-        
-        # 위험 점수 예측
-        risk_score = self.model.predict_risk(features)[0]
-        
-        # 생존 곡선 예측
-        times = np.arange(1, max_games + 1)
-        
+        self.feature_names = list(feature_names) if feature_names \
+            else list(getattr(model, 'feature_names', []) or [])
+        if not self.feature_names:
+            raise ValueError(
+                "PlayerPredictor needs feature_names (either passed in or stored on the model)."
+            )
+
+    def _features_to_array(self, features: Dict) -> np.ndarray:
+        """Dict → 학습에 쓰인 컬럼 순서대로 정렬된 1×D 배열."""
+        try:
+            row = [float(features[name]) for name in self.feature_names]
+        except KeyError as e:
+            raise KeyError(
+                f"Missing feature {e} — predictor expects {self.feature_names}"
+            ) from None
+        return np.array([row])
+
+    def _baseline_at(self, times: np.ndarray) -> np.ndarray:
         if self.kmf is not None:
-            baseline_surv = self.kmf.survival_function_at_times(times).values
-            individual_surv = baseline_surv ** np.exp(risk_score)
-        else:
-            # KMF가 없으면 단순 지수 분포 가정
-            lambda_param = 0.015
-            baseline_surv = np.exp(-lambda_param * times)
-            individual_surv = baseline_surv ** np.exp(risk_score)
-        
-        # 중간 생존 시간 (50% 생존 확률)
+            return self.kmf.survival_function_at_times(times).values
+        if getattr(self.model, 'baseline_survival', None) is not None:
+            return self.model.baseline_survival_at(times)
+        # Last-resort fallback: simple exponential. Surface a warning so users
+        # know predictions are coarse.
+        print("⚠️  No baseline survival available — using exponential fallback")
+        return np.exp(-0.015 * times)
+
+    def predict_player(self,
+                       features: Optional[Dict] = None,
+                       max_games: int = 200,
+                       **kwargs) -> Dict:
+        """
+        개별 선수 예측. features dict 또는 kwarg로 feature를 전달한다.
+
+        예: predict_player({'BMI': 29.0, 'YPC': 4.5, 'DrAge': 21})
+            predict_player(YPC=4.5, DrAge=21, Pick=4)
+        """
+        if features is None:
+            features = kwargs
+
+        X = self._features_to_array(features)
+        risk_score = float(self.model.predict_risk(X)[0])
+
+        times = np.arange(1, max_games + 1)
+        baseline_surv = np.clip(self._baseline_at(times), 1e-12, 1.0)
+        # NaN 안전 처리: NaN은 마지막 유효값으로 forward-fill
+        if np.isnan(baseline_surv).any():
+            baseline_surv = pd.Series(baseline_surv).ffill().bfill().values
+        individual_surv = baseline_surv ** np.exp(risk_score)
+
         median_idx = np.where(individual_surv <= 0.5)[0]
-        median_survival = times[median_idx[0]] if len(median_idx) > 0 else max_games
-        
-        # 특정 시점 생존 확률
-        survival_at_50 = individual_surv[49] if len(individual_surv) > 49 else np.nan
-        survival_at_100 = individual_surv[99] if len(individual_surv) > 99 else np.nan
-        survival_at_150 = individual_surv[149] if len(individual_surv) > 149 else np.nan
-        
-        # 결과 딕셔너리
-        prediction = {
-            'features': {
-                'BMI': bmi,
-                'YPC': ypc,
-                'Draft_Age': draft_age
-            },
+        median_survival = int(times[median_idx[0]]) if len(median_idx) > 0 else max_games
+
+        def at(t):
+            return float(individual_surv[t - 1]) if t <= max_games else float('nan')
+
+        return {
+            'features': dict(features),
             'risk_score': risk_score,
             'median_survival': median_survival,
-            'survival_curve': {
-                'times': times,
-                'probabilities': individual_surv
-            },
-            'survival_at': {
-                50: survival_at_50,
-                100: survival_at_100,
-                150: survival_at_150
-            },
-            'interpretation': self._interpret_prediction(risk_score, median_survival)
+            'survival_curve': {'times': times, 'probabilities': individual_surv},
+            'survival_at': {50: at(50), 100: at(100), 150: at(150)},
+            'interpretation': self._interpret_prediction(risk_score, median_survival),
         }
-        
-        return prediction
     
     def _interpret_prediction(self, risk_score: float, median_survival: int) -> Dict:
         """
@@ -148,83 +136,38 @@ class PlayerPredictor:
         }
     
     def predict_multiple_players(self, players_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        여러 선수 일괄 예측
-        
-        Parameters:
-        -----------
-        players_df : pd.DataFrame
-            선수 정보 데이터프레임 (BMI, YPC, DrAge 컬럼 필요)
-        
-        Returns:
-        --------
-        results_df : pd.DataFrame
-            예측 결과 데이터프레임
-        """
+        """여러 선수 일괄 예측 — players_df는 self.feature_names 컬럼을 포함해야 한다."""
         results = []
-        
         for idx, row in players_df.iterrows():
-            pred = self.predict_player(
-                bmi=row['BMI'],
-                ypc=row['YPC'],
-                draft_age=row['DrAge']
-            )
-            
-            result = {
+            feats = {name: row[name] for name in self.feature_names}
+            pred = self.predict_player(feats)
+            row_out = {
                 'Player': row.get('Player', f'Player_{idx}'),
-                'BMI': pred['features']['BMI'],
-                'YPC': pred['features']['YPC'],
-                'Draft_Age': pred['features']['Draft_Age'],
+                **{name: feats[name] for name in self.feature_names},
                 'Risk_Score': pred['risk_score'],
                 'Median_Survival': pred['median_survival'],
                 'Survival_50': pred['survival_at'][50],
                 'Survival_100': pred['survival_at'][100],
                 'Grade': pred['interpretation']['grade'],
-                'Risk_Level': pred['interpretation']['risk_level']
+                'Risk_Level': pred['interpretation']['risk_level'],
             }
-            
-            results.append(result)
-        
+            results.append(row_out)
         return pd.DataFrame(results)
-    
-    def compare_players(self, players_dict: Dict) -> pd.DataFrame:
-        """
-        선수 비교
-        
-        Parameters:
-        -----------
-        players_dict : dict
-            {'player_name': {'BMI': ..., 'YPC': ..., 'DrAge': ...}}
-        
-        Returns:
-        --------
-        comparison_df : pd.DataFrame
-            비교 결과
-        """
-        comparisons = []
-        
-        for name, features in players_dict.items():
-            pred = self.predict_player(
-                bmi=features['BMI'],
-                ypc=features['YPC'],
-                draft_age=features['DrAge']
-            )
 
+    def compare_players(self, players_dict: Dict) -> pd.DataFrame:
+        """{'player_name': {feature: value, ...}} 형식의 선수 비교."""
+        comparisons = []
+        for name, features in players_dict.items():
+            pred = self.predict_player(features)
             comparisons.append({
                 'Player': name,
-                'BMI': features['BMI'],
-                'YPC': features['YPC'],
-                'Draft_Age': features['DrAge'],
+                **{f: features.get(f) for f in self.feature_names},
                 'Risk_Score': pred['risk_score'],
                 'Expected_Career': pred['median_survival'],
                 'Survival_100': pred['survival_at'][100] * 100,
-                'Grade': pred['interpretation']['grade']
+                'Grade': pred['interpretation']['grade'],
             })
-
-        df = pd.DataFrame(comparisons)
-        df = df.sort_values('Risk_Score')  # 낮은 위험부터 정렬
-
-        return df
+        return pd.DataFrame(comparisons).sort_values('Risk_Score')
 
     def generate_report(self, prediction: Dict, player_name: str = "Player") -> str:
         """
@@ -251,9 +194,11 @@ class PlayerPredictor:
         # 선수 정보
         report.append(f"Player: {player_name}")
         report.append("-" * 70)
-        report.append(f"  BMI (Body Mass Index):    {prediction['features']['BMI']:.1f}")
-        report.append(f"  YPC (Yards Per Carry):    {prediction['features']['YPC']:.1f}")
-        report.append(f"  Draft Age:                {prediction['features']['Draft_Age']}")
+        for name, value in prediction['features'].items():
+            try:
+                report.append(f"  {name:24s} {float(value):.2f}")
+            except (TypeError, ValueError):
+                report.append(f"  {name:24s} {value}")
         report.append("")
 
         # 예측 결과
@@ -296,18 +241,19 @@ class PlayerPredictor:
 class FamousPlayersPredictor:
     """유명 NFL 선수 예측 클래스"""
 
-    # 유명 선수 데이터베이스 (추정치)
+    # 유명 선수 데이터베이스 (추정치). Pick은 실제 드래프트 순번이라 BMI fallback
+    # (Pick/YPC/DrAge) 시나리오에서도 예측이 의미를 가진다.
     FAMOUS_PLAYERS = {
-        'LaDainian Tomlinson': {'BMI': 30.5, 'YPC': 4.4, 'DrAge': 22, 'Actual_Games': 170},
-        'Emmitt Smith': {'BMI': 31.0, 'YPC': 4.2, 'DrAge': 21, 'Actual_Games': 226},
-        'Barry Sanders': {'BMI': 29.2, 'YPC': 5.0, 'DrAge': 21, 'Actual_Games': 153},
-        'Adrian Peterson': {'BMI': 31.8, 'YPC': 4.8, 'DrAge': 22, 'Actual_Games': 165},
-        'Walter Payton': {'BMI': 30.0, 'YPC': 4.4, 'DrAge': 21, 'Actual_Games': 190},
-        'Eric Dickerson': {'BMI': 31.5, 'YPC': 4.6, 'DrAge': 22, 'Actual_Games': 146},
-        'Bo Jackson': {'BMI': 32.5, 'YPC': 5.4, 'DrAge': 23, 'Actual_Games': 38},
-        'Ezekiel Elliott': {'BMI': 29.0, 'YPC': 4.5, 'DrAge': 21, 'Actual_Games': None},
-        'Saquon Barkley': {'BMI': 30.2, 'YPC': 4.6, 'DrAge': 21, 'Actual_Games': None},
-        'Derrick Henry': {'BMI': 32.0, 'YPC': 5.0, 'DrAge': 22, 'Actual_Games': None}
+        'LaDainian Tomlinson': {'BMI': 30.5, 'YPC': 4.4, 'DrAge': 22, 'Pick': 5, 'Rnd': 1, 'Actual_Games': 170},
+        'Emmitt Smith':        {'BMI': 31.0, 'YPC': 4.2, 'DrAge': 21, 'Pick': 17, 'Rnd': 1, 'Actual_Games': 226},
+        'Barry Sanders':       {'BMI': 29.2, 'YPC': 5.0, 'DrAge': 21, 'Pick': 3, 'Rnd': 1, 'Actual_Games': 153},
+        'Adrian Peterson':     {'BMI': 31.8, 'YPC': 4.8, 'DrAge': 22, 'Pick': 7, 'Rnd': 1, 'Actual_Games': 165},
+        'Walter Payton':       {'BMI': 30.0, 'YPC': 4.4, 'DrAge': 21, 'Pick': 4, 'Rnd': 1, 'Actual_Games': 190},
+        'Eric Dickerson':      {'BMI': 31.5, 'YPC': 4.6, 'DrAge': 22, 'Pick': 2, 'Rnd': 1, 'Actual_Games': 146},
+        'Bo Jackson':          {'BMI': 32.5, 'YPC': 5.4, 'DrAge': 23, 'Pick': 183, 'Rnd': 7, 'Actual_Games': 38},
+        'Ezekiel Elliott':     {'BMI': 29.0, 'YPC': 4.5, 'DrAge': 21, 'Pick': 4, 'Rnd': 1, 'Actual_Games': None},
+        'Saquon Barkley':      {'BMI': 30.2, 'YPC': 4.6, 'DrAge': 21, 'Pick': 2, 'Rnd': 1, 'Actual_Games': None},
+        'Derrick Henry':       {'BMI': 32.0, 'YPC': 5.0, 'DrAge': 22, 'Pick': 45, 'Rnd': 2, 'Actual_Games': None},
     }
 
     def __init__(self, predictor: PlayerPredictor):
@@ -320,40 +266,35 @@ class FamousPlayersPredictor:
         self.predictor = predictor
 
     def predict_all_famous_players(self) -> pd.DataFrame:
-        """모든 유명 선수 예측"""
+        """모든 유명 선수 예측 — predictor.feature_names에 따라 동적으로 컬럼 사용."""
+        feature_names = self.predictor.feature_names
         results = []
 
         for name, data in self.FAMOUS_PLAYERS.items():
-            pred = self.predictor.predict_player(
-                bmi=data['BMI'],
-                ypc=data['YPC'],
-                draft_age=data['DrAge']
-            )
+            missing = [f for f in feature_names if f not in data]
+            if missing:
+                print(f"⚠️  Skipping {name}: missing {missing} for current feature set")
+                continue
+
+            feats = {f: data[f] for f in feature_names}
+            pred = self.predictor.predict_player(feats)
 
             result = {
                 'Player': name,
-                'BMI': data['BMI'],
-                'YPC': data['YPC'],
-                'Draft_Age': data['DrAge'],
+                **feats,
                 'Risk_Score': pred['risk_score'],
                 'Predicted_Career': pred['median_survival'],
                 'Actual_Career': data.get('Actual_Games'),
                 'Survival_100': pred['survival_at'][100] * 100,
-                'Grade': pred['interpretation']['grade']
+                'Grade': pred['interpretation']['grade'],
             }
-
-            # 예측 vs 실제 오차
-            if result['Actual_Career']:
-                result['Prediction_Error'] = abs(result['Predicted_Career'] - result['Actual_Career'])
-            else:
-                result['Prediction_Error'] = None
-
+            actual = result['Actual_Career']
+            result['Prediction_Error'] = (
+                abs(result['Predicted_Career'] - actual) if actual else None
+            )
             results.append(result)
 
-        df = pd.DataFrame(results)
-        df = df.sort_values('Predicted_Career', ascending=False)
-
-        return df
+        return pd.DataFrame(results).sort_values('Predicted_Career', ascending=False)
 
     def compare_with_actual(self) -> Dict:
         """예측과 실제 비교 분석"""

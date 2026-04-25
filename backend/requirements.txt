@@ -19,6 +19,11 @@ seaborn>=0.12.0
 # Utilities
 tqdm>=4.64.0
 
+# API serving
+fastapi>=0.115,<0.120
+uvicorn[standard]>=0.30
+pydantic>=2.6,<3
+
 # Optional: For GPU support
 # tensorflow-gpu>=2.10.0
 

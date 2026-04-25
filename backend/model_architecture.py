@@ -10,6 +10,7 @@ from tensorflow.keras import layers
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Optional, List
 import pickle
+import os
 
 
 # ==================== Custom Loss Functions ====================
@@ -87,36 +88,35 @@ class DeepSurv:
     신경망을 사용하여 비선형 위험 함수를 학습합니다.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  input_dim: int,
                  hidden_layers: List[int] = [64, 32, 16],
                  dropout_rate: float = 0.3,
                  activation: str = 'relu',
-                 l2_reg: float = 0.01):
-        """
-        Parameters:
-        -----------
-        input_dim : int
-            입력 특징 차원
-        hidden_layers : list
-            각 은닉층의 뉴런 수 리스트
-        dropout_rate : float
-            Dropout 비율 (0~1)
-        activation : str
-            활성화 함수
-        l2_reg : float
-            L2 정규화 계수
-        """
+                 l2_reg: float = 0.01,
+                 feature_names: Optional[List[str]] = None):
         self.input_dim = input_dim
         self.hidden_layers = hidden_layers
         self.dropout_rate = dropout_rate
         self.activation = activation
         self.l2_reg = l2_reg
-        
+        self.feature_names = list(feature_names) if feature_names else []
+
         self.model = None
         self.scaler = StandardScaler()
         self.history = None
-        
+
+        # Cox baseline survival is computed once on the training set after fit()
+        # (Breslow estimator) and persisted with the model so prediction-only
+        # mode does not need a dummy KaplanMeierFitter.
+        self.baseline_times: Optional[np.ndarray] = None
+        self.baseline_survival: Optional[np.ndarray] = None
+
+        # Trained-model metadata surfaced in /api/health so the UI can render
+        # provenance without inspecting the model file directly.
+        self.metrics: dict = {}
+        self.training_meta: dict = {}
+
         self._build_model()
     
     def _build_model(self):
@@ -238,8 +238,53 @@ class DeepSurv:
             callbacks=callbacks,
             verbose=verbose
         )
-        
+
+        # Compute baseline survival on the training set for later prediction.
+        self._compute_baseline_survival(X_scaled, y_event, y_time)
+
         return self.history
+
+    def _compute_baseline_survival(self,
+                                    X_scaled: np.ndarray,
+                                    y_event: np.ndarray,
+                                    y_time: np.ndarray):
+        """Breslow baseline cumulative hazard / survival on training data."""
+        risk = self.model.predict(X_scaled, verbose=0).flatten()
+        exp_risk = np.exp(risk)
+
+        order = np.argsort(y_time)
+        t_sorted = y_time[order]
+        e_sorted = y_event[order]
+        r_sorted = exp_risk[order]
+
+        # Risk set at each time = sum of exp(risk) over individuals still at risk.
+        # Walking forward in time, the risk set shrinks as people leave.
+        risk_set = r_sorted[::-1].cumsum()[::-1]
+
+        unique_t = np.unique(t_sorted)
+        cum_hazard = np.zeros_like(unique_t, dtype=float)
+        H = 0.0
+        for i, t in enumerate(unique_t):
+            mask = t_sorted == t
+            d = e_sorted[mask].sum()
+            denom = risk_set[np.argmax(t_sorted >= t)]
+            if denom > 0 and d > 0:
+                H += d / denom
+            cum_hazard[i] = H
+
+        self.baseline_times = unique_t
+        self.baseline_survival = np.exp(-cum_hazard)
+
+    def baseline_survival_at(self, times: np.ndarray) -> np.ndarray:
+        """Step-function lookup of baseline survival at given times."""
+        if self.baseline_times is None:
+            raise RuntimeError("Baseline survival not available — call fit() first or load() a saved model.")
+        idx = np.searchsorted(self.baseline_times, times, side='right') - 1
+        idx = np.clip(idx, 0, len(self.baseline_times) - 1)
+        out = self.baseline_survival[idx]
+        # Times before the first event default to S(t)=1
+        out = np.where(times < self.baseline_times[0], 1.0, out)
+        return out
     
     def predict_risk(self, X: np.ndarray) -> np.ndarray:
         """
@@ -261,57 +306,67 @@ class DeepSurv:
     
     def predict_survival(self,
                         X: np.ndarray,
-                        baseline_survival: np.ndarray,
-                        times: np.ndarray) -> np.ndarray:
+                        times: np.ndarray,
+                        baseline_survival: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        생존 확률 예측
-        
-        S(t|X) = S0(t)^exp(risk_score)
-        
-        Parameters:
-        -----------
-        X : np.ndarray
-            특징 행렬
-        baseline_survival : np.ndarray
-            기준 생존 확률
-        times : np.ndarray
-            시간 포인트
-        
-        Returns:
-        --------
-        survival_probs : np.ndarray
-            각 시간에서의 생존 확률
+        S(t|X) = S0(t) ^ exp(risk_score)
+
+        baseline_survival가 None이면 모델에 저장된 학습 baseline을 사용한다.
         """
         risk_scores = self.predict_risk(X)
-        
-        survival_probs = []
-        for risk in risk_scores:
-            surv = baseline_survival ** np.exp(risk)
-            survival_probs.append(surv)
-        
-        return np.array(survival_probs)
+        if baseline_survival is None:
+            baseline = self.baseline_survival_at(np.asarray(times))
+        else:
+            baseline = np.asarray(baseline_survival)
+
+        baseline = np.clip(baseline, 1e-12, 1.0)
+        return baseline[None, :] ** np.exp(risk_scores)[:, None]
     
     def save(self, filepath: str):
-        """모델 저장"""
+        """Save model weights and all metadata needed for prediction-only mode."""
         self.model.save(f'{filepath}_model.h5')
-        
-        # Scaler 저장
-        with open(f'{filepath}_scaler.pkl', 'wb') as f:
-            pickle.dump(self.scaler, f)
-        
+
+        meta = {
+            'scaler': self.scaler,
+            'feature_names': self.feature_names,
+            'baseline_times': self.baseline_times,
+            'baseline_survival': self.baseline_survival,
+            'config': self.get_config(),
+            'metrics': self.metrics,
+            'training_meta': self.training_meta,
+        }
+        with open(f'{filepath}_meta.pkl', 'wb') as f:
+            pickle.dump(meta, f)
+
         print(f"✓ 모델 저장 완료: {filepath}")
-    
+
     def load(self, filepath: str):
-        """모델 로드"""
+        """Load model weights, scaler, baseline survival, and feature metadata."""
         self.model = keras.models.load_model(
             f'{filepath}_model.h5',
             custom_objects={'cox_partial_likelihood_loss': cox_partial_likelihood_loss}
         )
-        
-        # Scaler 로드
-        with open(f'{filepath}_scaler.pkl', 'rb') as f:
-            self.scaler = pickle.load(f)
-        
+
+        # New unified metadata file; fall back to legacy `_scaler.pkl` if absent.
+        meta_path = f'{filepath}_meta.pkl'
+        legacy_scaler_path = f'{filepath}_scaler.pkl'
+        if os.path.exists(meta_path):
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            self.scaler = meta['scaler']
+            self.feature_names = meta.get('feature_names', [])
+            self.baseline_times = meta.get('baseline_times')
+            self.baseline_survival = meta.get('baseline_survival')
+            self.metrics = meta.get('metrics', {})
+            self.training_meta = meta.get('training_meta', {})
+        elif os.path.exists(legacy_scaler_path):
+            with open(legacy_scaler_path, 'rb') as f:
+                self.scaler = pickle.load(f)
+            print("⚠️  Legacy save format — baseline survival not available, "
+                  "predictions will fall back to a uniform exponential baseline.")
+        else:
+            raise FileNotFoundError(f"No metadata found at {meta_path} or {legacy_scaler_path}")
+
         print(f"✓ 모델 로드 완료: {filepath}")
     
     def summary(self):
@@ -325,7 +380,8 @@ class DeepSurv:
             'hidden_layers': self.hidden_layers,
             'dropout_rate': self.dropout_rate,
             'activation': self.activation,
-            'l2_reg': self.l2_reg
+            'l2_reg': self.l2_reg,
+            'feature_names': self.feature_names,
         }
 
 

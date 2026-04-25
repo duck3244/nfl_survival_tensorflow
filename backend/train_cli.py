@@ -6,8 +6,24 @@
 import os
 import sys
 import argparse
+import random
 import warnings
-warnings.filterwarnings('ignore')
+
+# Suppress only the noisy categories instead of every warning, so genuine
+# bugs (e.g. divide-by-zero) still surface.
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
+
+
+def set_global_seed(seed: int = 42):
+    """Reproducibility — covers Python random, NumPy, and TensorFlow."""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    import numpy as _np
+    _np.random.seed(seed)
+    import tensorflow as _tf
+    _tf.random.set_seed(seed)
 
 # 모듈 임포트
 from data_preprocessing import NFLDataPreprocessor, create_sample_data
@@ -61,22 +77,23 @@ def run_full_pipeline(data_path='nfl.csv',
     
     preprocessor = NFLDataPreprocessor(data_path)
     df = preprocessor.preprocess()
-    
-    # 특징 행렬 추출
-    X, y_event, y_time = preprocessor.get_feature_matrix(
-        feature_columns=['BMI', 'YPC', 'DrAge']
-    )
-    
+
+    # 특징 행렬 추출 — 자동 폴백 (BMI 없으면 Pick으로 대체)
+    X, y_event, y_time = preprocessor.get_feature_matrix()
+    feature_names = preprocessor.feature_columns_used
+
     print(f"\n✓ 데이터 준비 완료")
     print(f"  - 샘플 수: {len(X)}")
+    print(f"  - 사용 features: {feature_names}")
     print(f"  - 평균 커리어: {y_time.mean():.1f} 경기")
     print(f"  - 중간 커리어: {np.median(y_time):.1f} 경기")
-    
+
     # ========== 2. 모델 생성 및 컴파일 ==========
     print("\n[STEP 2/6] 모델 생성")
     print("-" * 70)
-    
-    model = create_deepsurv_model(input_dim=3, model_type=model_type)
+
+    model = create_deepsurv_model(input_dim=len(feature_names), model_type=model_type)
+    model.feature_names = feature_names
     model.compile(learning_rate=0.001)
     
     print(f"✓ {model_type.capitalize()} 모델 생성 완료")
@@ -175,9 +192,11 @@ def run_full_pipeline(data_path='nfl.csv',
         index=False
     )
     
-    # 개별 선수 예측 예시
+    # 개별 선수 예측 예시 — 현재 feature 세트에 맞춰 합리적 기본값 구성
     print("\n예시 선수 예측:")
-    example_pred = predictor.predict_player(bmi=29.0, ypc=4.5, draft_age=21)
+    example_defaults = {'BMI': 29.0, 'YPC': 4.5, 'DrAge': 21, 'Pick': 30, 'Rnd': 2}
+    example_features = {f: example_defaults.get(f, 0) for f in feature_names}
+    example_pred = predictor.predict_player(example_features)
     report = predictor.generate_report(example_pred, "Example Player")
     print(report)
     
@@ -191,6 +210,21 @@ def run_full_pipeline(data_path='nfl.csv',
     # ========== 모델 저장 ==========
     if save_model:
         print("\n모델 저장 중...")
+        from datetime import datetime, timezone
+        model.metrics = {
+            'train_c_index': float(metrics['train_c_index']),
+            'test_c_index': float(metrics['test_c_index']),
+            'cv_mean_c_index': float(cv_results['mean_c_index']),
+            'cv_std_c_index': float(cv_results['std_c_index']),
+        }
+        model.training_meta = {
+            'trained_at': datetime.now(timezone.utc).isoformat(),
+            'sample_size': int(len(X)),
+            'train_size': int(metrics['train_samples']),
+            'test_size': int(metrics['test_samples']),
+            'epochs': int(epochs),
+            'model_type': model_type,
+        }
         model.save(os.path.join(output_dir, 'deepsurv_model'))
         print(f"✓ 모델 저장 완료: {output_dir}/deepsurv_model")
     
@@ -210,7 +244,7 @@ def run_full_pipeline(data_path='nfl.csv',
     print(f"    ├── example_prediction_report.txt")
     if save_model:
         print(f"    ├── deepsurv_model_model.h5")
-        print(f"    └── deepsurv_model_scaler.pkl")
+        print(f"    └── deepsurv_model_meta.pkl")
     
     print(f"\n🎯 최종 성능:")
     print(f"  Test C-index: {metrics['test_c_index']:.4f}")
@@ -242,31 +276,34 @@ def run_quick_demo():
     )
 
 
-def run_predict_mode(model_path, bmi, ypc, draft_age):
-    """예측 전용 모드"""
+def run_predict_mode(model_path, feature_overrides: dict):
+    """예측 전용 모드 — 학습 시 저장된 feature_names + baseline survival 사용."""
     print("=" * 70)
     print("예측 모드")
     print("=" * 70)
-    
-    # 모델 로드
+
     print("\n모델 로딩 중...")
-    model = DeepSurv(input_dim=3)
+    # input_dim은 load() 후 model.input_dim으로 갱신되지 않으므로 임시값 사용.
+    # 실제 가중치/scaler는 load()가 채워주므로 예측에는 영향 없음.
+    model = DeepSurv(input_dim=1)
     model.load(model_path)
-    print("✓ 모델 로드 완료")
-    
-    # 더미 KMF (실제로는 저장된 것 사용)
-    kmf = KaplanMeierFitter()
-    y_dummy = np.random.exponential(60, 100)
-    kmf.fit(y_dummy, np.ones(100))
-    
-    # 예측
-    predictor = PlayerPredictor(model, kmf)
-    prediction = predictor.predict_player(bmi, ypc, draft_age)
-    
-    # 결과 출력
+    print(f"✓ 모델 로드 완료 (features: {model.feature_names})")
+
+    if not model.feature_names:
+        raise RuntimeError("Loaded model has no feature_names — re-train with the updated pipeline.")
+
+    # 사용자 입력에 누락된 feature는 합리적 기본값으로 보충
+    defaults = {'BMI': 29.0, 'YPC': 4.5, 'DrAge': 22, 'Pick': 50, 'Rnd': 3}
+    feats = {name: feature_overrides.get(name, defaults.get(name, 0))
+             for name in model.feature_names}
+    print(f"  입력 features: {feats}")
+
+    predictor = PlayerPredictor(model)
+    prediction = predictor.predict_player(feats)
+
     report = predictor.generate_report(prediction, "Your Player")
     print("\n" + report)
-    
+
     return prediction
 
 
@@ -323,9 +360,17 @@ def main():
     
     parser.add_argument('--age', type=int,
                        help='Draft Age (예측 모드)')
+
+    parser.add_argument('--pick', type=int,
+                       help='Draft Pick (예측 모드, BMI fallback 시 사용)')
     
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (재현성)')
+
     args = parser.parse_args()
-    
+
+    set_global_seed(args.seed)
+
     # 모드별 실행
     if args.mode == 'full':
         results = run_full_pipeline(
@@ -341,15 +386,14 @@ def main():
         results = run_quick_demo()
         
     elif args.mode == 'predict':
-        if not all([args.model, args.bmi, args.ypc, args.age]):
-            parser.error("예측 모드는 --model, --bmi, --ypc, --age 필수")
-        
-        results = run_predict_mode(
-            args.model,
-            args.bmi,
-            args.ypc,
-            args.age
-        )
+        if not args.model:
+            parser.error("예측 모드는 --model 필수 (저장된 모델 경로)")
+        feature_overrides = {}
+        if args.bmi is not None: feature_overrides['BMI'] = args.bmi
+        if args.ypc is not None: feature_overrides['YPC'] = args.ypc
+        if args.age is not None: feature_overrides['DrAge'] = args.age
+        if args.pick is not None: feature_overrides['Pick'] = args.pick
+        results = run_predict_mode(args.model, feature_overrides)
     
     return results
 

@@ -153,11 +153,17 @@ class SurvivalVisualizer:
         save_path : str
             저장 경로
         """
-        # 위험 점수로 그룹 분할
-        risk_groups = pd.qcut(risk_scores, q=n_groups, 
-                             labels=['Low Risk', 'Medium Risk', 'High Risk'][:n_groups])
-        
-        self.plot_km_by_groups(y_time, y_event, risk_groups, 
+        # 위험 점수로 그룹 분할 — n_groups에 맞춰 라벨 동적 생성
+        if n_groups == 2:
+            labels = ['Low Risk', 'High Risk']
+        elif n_groups == 3:
+            labels = ['Low Risk', 'Medium Risk', 'High Risk']
+        else:
+            labels = [f'Q{i+1} Risk' for i in range(n_groups)]
+
+        risk_groups = pd.qcut(risk_scores, q=n_groups, labels=labels)
+
+        self.plot_km_by_groups(y_time, y_event, risk_groups,
                               group_names=risk_groups.categories.tolist(),
                               save_path=save_path)
     

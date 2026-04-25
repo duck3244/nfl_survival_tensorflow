@@ -7,7 +7,8 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, Optional
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 
 class NFLDataPreprocessor:
@@ -23,6 +24,7 @@ class NFLDataPreprocessor:
         self.filepath = filepath
         self.raw_data = None
         self.processed_data = None
+        self.feature_columns_used: list = []
         
     def load_data(self) -> pd.DataFrame:
         """CSV 파일에서 데이터 로드"""
@@ -56,18 +58,24 @@ class NFLDataPreprocessor:
         if 'AP1_binary' not in df.columns and 'AP1' in df.columns:
             df['AP1_binary'] = (df['AP1'] >= 1).astype(int)
 
-        # BMI (Body Mass Index)
-        if 'BMI' not in df.columns:
-            if 'Weight' in df.columns and 'Height' in df.columns:
-                df['BMI'] = (df['Weight'] / (df['Height'] ** 2)) * 703
-            else:
-                # Weight와 Height가 없으면 기본값 또는 추정값 사용
-                print("⚠️  Warning: Weight/Height columns not found. Using default BMI values.")
-                df['BMI'] = np.random.normal(29.0, 2.0, len(df))  # 평균 29, 표준편차 2
+        # BMI (Body Mass Index) — only computed when raw inputs exist.
+        # Random fallback was removed: it injected pure noise into a model feature.
+        if 'BMI' not in df.columns and 'Weight' in df.columns and 'Height' in df.columns:
+            df['BMI'] = (df['Weight'] / (df['Height'] ** 2)) * 703
 
-        # Retired Indicator (모든 선수가 은퇴한 경우)
+        # Retired Indicator — derive real censoring from career end year.
+        # Players whose final season equals the dataset snapshot year may still
+        # be active, so they are right-censored (event=0).
         if 'Retired' not in df.columns:
-            df['Retired'] = 1
+            if 'To' in df.columns and df['To'].notna().any():
+                snapshot_year = df['To'].max()
+                df['Retired'] = (df['To'] < snapshot_year).astype(int)
+                n_censored = (df['Retired'] == 0).sum()
+                print(f"  검열 정의: snapshot={int(snapshot_year)}, "
+                      f"censored={n_censored}/{len(df)} "
+                      f"({n_censored/len(df)*100:.1f}%)")
+            else:
+                df['Retired'] = 1
 
         # 추가 유용한 특징들 (컬럼이 있을 때만)
         if 'TD' in df.columns and 'G' in df.columns:
@@ -81,8 +89,15 @@ class NFLDataPreprocessor:
 
         return df
 
-    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """결측치 및 이상치 처리"""
+    def clean_data(self, df: pd.DataFrame, remove_outliers: bool = True) -> pd.DataFrame:
+        """
+        결측치 및 이상치 처리.
+
+        remove_outliers=True 시 IQR 기반 이상치 제거를 수행한다. 이 단계는
+        train/test 분할 전에 적용되므로 엄밀한 의미에서 약간의 정보 누수가
+        있을 수 있으나, NFL 통계의 물리적 범위 검증 목적이 강해 실용적으로
+        허용한다. 엄밀한 평가가 필요하면 False로 호출하라.
+        """
         df = df.copy()
 
         # 필수 컬럼 확인
@@ -106,14 +121,15 @@ class NFLDataPreprocessor:
             df = df.dropna(subset=essential_cols)
 
         # 이상치 제거 (IQR 방법) - 컬럼이 있을 때만
-        for col in ['BMI', 'YPC']:
-            if col in df.columns:
-                Q1 = df[col].quantile(0.25)
-                Q3 = df[col].quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 3 * IQR
-                upper_bound = Q3 + 3 * IQR
-                df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
+        if remove_outliers:
+            for col in ['BMI', 'YPC']:
+                if col in df.columns:
+                    Q1 = df[col].quantile(0.25)
+                    Q3 = df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 3 * IQR
+                    upper_bound = Q3 + 3 * IQR
+                    df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
 
         # 0 경기 선수 제거
         if 'G' in df.columns:
@@ -121,7 +137,7 @@ class NFLDataPreprocessor:
 
         return df
 
-    def preprocess(self) -> pd.DataFrame:
+    def preprocess(self, remove_outliers: bool = True) -> pd.DataFrame:
         """전체 전처리 파이프라인 실행"""
         # 1. 데이터 로드
         if self.raw_data is None:
@@ -133,7 +149,7 @@ class NFLDataPreprocessor:
         df = self.create_features(df)
 
         # 3. 데이터 정제
-        df = self.clean_data(df)
+        df = self.clean_data(df, remove_outliers=remove_outliers)
 
         self.processed_data = df
 
@@ -141,44 +157,48 @@ class NFLDataPreprocessor:
 
         return df
 
+    # When `feature_columns=None`, pick the first 3 available from this list.
+    # BMI comes first (best feature when Weight/Height present); Pick/Rnd are
+    # the pre-career fallbacks when BMI is unavailable.
+    DEFAULT_FEATURE_PRIORITY = ['BMI', 'YPC', 'DrAge', 'Pick', 'Rnd']
+
     def get_feature_matrix(self,
                           feature_columns: list = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        모델 학습용 특징 행렬 반환
+        모델 학습용 특징 행렬 반환.
 
-        Parameters:
-        -----------
-        feature_columns : list
-            사용할 특징 컬럼 리스트 (기본값: ['BMI', 'YPC', 'DrAge'])
-
-        Returns:
-        --------
-        X : np.ndarray
-            특징 행렬
-        y_event : np.ndarray
-            이벤트 발생 여부 (1=은퇴)
-        y_time : np.ndarray
-            생존 시간 (경기 수)
+        feature_columns=None이면 DEFAULT_FEATURE_PRIORITY 순서로 사용 가능한
+        컬럼 3개를 자동 선택하고, 실제 사용된 컬럼은
+        `self.feature_columns_used`에 저장한다.
         """
         if self.processed_data is None:
             self.preprocess()
 
         if feature_columns is None:
-            feature_columns = ['BMI', 'YPC', 'DrAge']
-
-        # 존재하는 컬럼만 사용
-        available_features = [col for col in feature_columns if col in self.processed_data.columns]
+            available_features = [c for c in self.DEFAULT_FEATURE_PRIORITY
+                                  if c in self.processed_data.columns][:3]
+        else:
+            available_features = [c for c in feature_columns
+                                  if c in self.processed_data.columns]
+            missing = [c for c in feature_columns if c not in available_features]
+            if missing:
+                print(f"⚠️  Missing features {missing}. Using only {available_features}")
 
         if not available_features:
-            raise ValueError(f"None of the requested features {feature_columns} are available in the data")
+            raise ValueError(
+                f"None of the requested features are available. "
+                f"Available numeric columns: {list(self.processed_data.select_dtypes('number').columns)}"
+            )
 
-        if len(available_features) < len(feature_columns):
-            missing = set(feature_columns) - set(available_features)
-            print(f"⚠️  Warning: Missing features {missing}. Using only {available_features}")
+        # 선택된 feature에 NaN 행이 남아있을 수 있으므로 제거
+        subset = self.processed_data.dropna(subset=available_features)
 
-        X = self.processed_data[available_features].values
-        y_event = self.processed_data['Retired'].values
-        y_time = self.processed_data['G'].values
+        X = subset[available_features].values
+        y_event = subset['Retired'].values
+        y_time = subset['G'].values
+
+        self.feature_columns_used = available_features
+        print(f"✓ Features in use: {available_features}")
 
         return X, y_event, y_time
 
